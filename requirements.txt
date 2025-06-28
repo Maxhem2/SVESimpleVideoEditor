@@ -3,3 +3,4 @@ PyQt5
 opencv-python
 PyAudio
 numpy
+imageio-ffmpeg

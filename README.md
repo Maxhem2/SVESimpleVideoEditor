@@ -15,17 +15,7 @@ You can download the latest installer for Windows from the **[Releases](https://
 3.  Under the "Assets" section, download the `SVE-Installer-v...exe` file.
 4.  Run the downloaded installer to set up the application on your system.
 
-## Getting Started (For Developers)
-
-### Requirements
-
-To run or build the project from source, you will need:
-
-  * Python (tested on 3.12)
-  * The following Python libraries:
-      * `PyQt5`, `moviepy==1.0.3`, `opencv-python`, `PyAudio`, `numpy`
-
-Follow these instructions to set up your development environment and run the editor from its source code.
+## Getting Started (For Developers tested on Python 3.12)
 
 ### 1\. Set Up the Environment
 
@@ -42,50 +32,18 @@ python -m venv venv
 # Activate the virtual environment
 # On Windows:
 .\venv\Scripts\activate
-# On macOS/Linux:
-source venv/bin/activate
-```
 
-### 2\. Install Dependencies
-
-Install all the required packages using pip.
-
-```bash
 # Make sure your virtual environment is active
 pip install -r requirements.txt
 ```
 
-### 3\. Running the Application
+### 2\. Running the Application
 
 Once the dependencies are installed, you can run the application directly:
 
 ```bash
 python SimpleVideoEditor.py
 ```
-
-## Compiling for Windows
-
-You can package the editor into a single standalone `.exe` file for Windows using PyInstaller.
-
-### 1\. Prerequisites
-
-Ensure you have completed the setup steps above and have installed `pyinstaller` in your virtual environment.
-
-```bash
-pip install pyinstaller
-```
-
-### 2\. Run the Build Command
-
-With your virtual environment active, run the following command in your terminal. This command bundles the script, assets, and all dependencies into a single executable file.
-
-```bash
-pyinstaller --name SVESimpleVideoEditor --onefile --windowed --icon="icon.ico" --add-data="icon.ico;." --noconfirm SimpleVideoEditor.py
-```
-
-### 3\. Find Your Executable
-
-After the build process completes, you will find your standalone application inside the `dist` folder: `dist/SVESimpleVideoEditor.exe`.
 
 ## License
 
