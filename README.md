@@ -4,11 +4,11 @@ A straightforward simple video editor built with Python. SVE provides essential 
 
 ## Features
 
-Video Trimming, Interactive Cropping, Audio Extraction, Mute Audio
+Video Trimming, Interactive Cropping, Gif Creation, Audio Extraction, Mute Audio
 
-## Installation (For Users)
+## Installation (For Windows Users)
 
-You can download the latest installer for Windows from the **[Releases](https://github.com/Maxhem2/SVESimpleVideoEditor/releases)** page.
+You can download the latest installer from the **[Releases](https://github.com/Maxhem2/SVESimpleVideoEditor/releases)** page.
 
 1.  Go to the [Releases](https://github.com/Maxhem2/SVESimpleVideoEditor/releases) page.
 2.  Find the latest release, which will be at the top.

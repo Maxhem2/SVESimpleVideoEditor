@@ -424,6 +424,77 @@ class SaveWorker(QObject):
         finally:
             self.finished.emit(error_message, self.save_path)
 
+class SaveGifWorker(QObject):
+    finished = pyqtSignal(str, str)
+    progress = pyqtSignal(int)
+
+    def __init__(self, video_path, save_path, start_time, end_time, crop_details, gif_fps, gif_width):
+        super().__init__()
+        self.video_path = video_path
+        self.save_path = save_path
+        self.start_time = start_time
+        self.end_time = end_time
+        self.crop_details = crop_details
+        self.gif_fps = gif_fps
+        self.gif_width = gif_width
+        self.duration = self.end_time - self.start_time
+
+    def run(self):
+        error_message = ""
+        ffmpeg_path = get_ffmpeg_exe()
+
+        video_filters = []
+        if self.crop_details:
+            w, h, x, y = self.crop_details['width'], self.crop_details['height'], self.crop_details['x1'], self.crop_details['y1']
+            video_filters.append(f"crop={w}:{h}:{x}:{y}")
+        
+        video_filters.append(f"fps={self.gif_fps}")
+        video_filters.append(f"scale={self.gif_width}:-1:flags=lanczos")
+        
+        filter_complex = f"{','.join(video_filters)},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+        
+        cmd = [
+            ffmpeg_path, '-y', '-ss', str(self.start_time), '-to', str(self.end_time),
+            '-i', self.video_path, '-filter_complex', filter_complex, self.save_path
+        ]
+        
+        print(f"DEBUG: Running FFmpeg command for GIF: {' '.join(cmd)}")
+
+        try:
+            startupinfo = None
+            creationflags = 0
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                creationflags = subprocess.CREATE_NO_WINDOW
+
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, startupinfo=startupinfo, creationflags=creationflags)
+            
+            stderr_lines = []
+            time_regex = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
+
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                match = time_regex.search(line)
+                if match:
+                    hours, minutes, seconds, hundredths = map(int, match.groups())
+                    current_seconds = hours * 3600 + minutes * 60 + seconds + hundredths / 100
+                    if self.duration > 0:
+                        percent = min(100, int((current_seconds / self.duration) * 100))
+                        self.progress.emit(percent)
+
+            return_code = proc.wait()
+
+            if return_code != 0:
+                error_message = f"FFmpeg Error (code {return_code}):\n{''.join(stderr_lines)}"
+            else:
+                self.progress.emit(100)
+        except Exception as e:
+            error_message = str(e)
+        finally:
+            self.finished.emit(error_message, self.save_path)
+
+
 class SaveAudioWorker(QObject):
     finished = pyqtSignal(str, str)
     progress = pyqtSignal(int)
@@ -502,6 +573,7 @@ class VideoEditorWindow(QMainWindow):
         
         self.load_thread, self.load_worker = None, None
         self.save_thread, self.save_worker = None, None
+        self.save_gif_thread, self.save_gif_worker = None, None
         self.save_audio_thread, self.save_audio_worker = None, None
 
         self.playback_timer = QTimer(self)
@@ -548,6 +620,7 @@ class VideoEditorWindow(QMainWindow):
         self.set_end_button = QPushButton("Set End")
         self.crop_button = QPushButton("Crop")
         self.save_button = QPushButton("Save Video")
+        self.save_gif_button = QPushButton("Save GIF")
         self.save_audio_button = QPushButton("Save Audio")
         
         controls_grid = QGridLayout()
@@ -578,6 +651,7 @@ class VideoEditorWindow(QMainWindow):
         buttons_right_layout = QHBoxLayout()
         buttons_right_layout.setContentsMargins(0,0,0,0)
         buttons_right_layout.addWidget(self.save_button)
+        buttons_right_layout.addWidget(self.save_gif_button)
         buttons_right_layout.addWidget(self.save_audio_button)
         controls_grid.addLayout(buttons_right_layout, 1, 2, Qt.AlignRight)
 
@@ -595,6 +669,7 @@ class VideoEditorWindow(QMainWindow):
         self.set_end_button.clicked.connect(self.set_end_point)
         self.crop_button.clicked.connect(self.start_cropping_and_pause)
         self.save_button.clicked.connect(self.save_video)
+        self.save_gif_button.clicked.connect(self.save_gif)
         self.save_audio_button.clicked.connect(self.save_audio_only)
 
     def detect_and_display_ffmpeg(self):
@@ -610,6 +685,7 @@ class VideoEditorWindow(QMainWindow):
         self.set_end_button.setEnabled(is_video_loaded and not is_processing)
         self.crop_button.setEnabled(is_video_loaded and not is_processing)
         self.save_button.setEnabled(is_video_loaded and not is_processing)
+        self.save_gif_button.setEnabled(is_video_loaded and not is_processing)
         self.save_audio_button.setEnabled(self.has_audio and not is_processing)
         self.mute_button.setEnabled(self.has_audio and not is_processing)
         if is_video_loaded:
@@ -800,6 +876,35 @@ class VideoEditorWindow(QMainWindow):
     def on_save_progress(self, percent):
         self.progress_bar.setValue(percent)
 
+    def get_crop_details(self):
+        if not self.video_display.crop_area:
+            return None
+
+        pixmap_rect = self.video_display.pixmap_item.sceneBoundingRect()
+        crop_rect_scene = self.video_display.crop_area
+
+        if pixmap_rect.width() > 0 and pixmap_rect.height() > 0:
+            orig_w, orig_h = self.original_width, self.original_height
+            scale_x = orig_w / pixmap_rect.width()
+            scale_y = orig_h / pixmap_rect.height()
+
+            x1 = (crop_rect_scene.x() - pixmap_rect.x()) * scale_x
+            y1 = (crop_rect_scene.y() - pixmap_rect.y()) * scale_y
+            w = crop_rect_scene.width() * scale_x
+            h = crop_rect_scene.height() * scale_y
+            
+            x1_int = max(0, int(x1))
+            y1_int = max(0, int(y1))
+            w_int = int(w) - (int(w) % 2)
+            h_int = int(h) - (int(h) % 2)
+            
+            w_int = min(w_int, orig_w - x1_int)
+            h_int = min(h_int, orig_h - y1_int)
+
+            if w_int > 0 and h_int > 0:
+                return {'x1': x1_int, 'y1': y1_int, 'width': w_int, 'height': h_int}
+        return None
+
     def save_video(self):
         if not self.video_path: return
         if self.is_playing: self.toggle_play_pause()
@@ -814,27 +919,7 @@ class VideoEditorWindow(QMainWindow):
         self.progress_bar.setVisible(True)
 
         start_time, end_time = self.start_frame / self.fps, self.end_frame / self.fps
-
-        crop_details = None
-        if self.video_display.crop_area:
-            pixmap_rect = self.video_display.pixmap_item.sceneBoundingRect()
-            crop_rect_scene = self.video_display.crop_area
-
-            if pixmap_rect.width() > 0 and pixmap_rect.height() > 0:
-                orig_w, orig_h = self.original_width, self.original_height
-                scale_x, scale_y = orig_w / pixmap_rect.width(), orig_h / pixmap_rect.height()
-
-                x1, y1 = (crop_rect_scene.x() - pixmap_rect.x()) * scale_x, (crop_rect_scene.y() - pixmap_rect.y()) * scale_y
-                w, h = crop_rect_scene.width() * scale_x, crop_rect_scene.height() * scale_y
-                
-                x1_int, y1_int = max(0, int(x1)), max(0, int(y1))
-                w_int = int(w) - (int(w) % 2)
-                h_int = int(h) - (int(h) % 2)
-                w_int = min(w_int, orig_w - x1_int)
-                h_int = min(h_int, orig_h - y1_int)
-
-                if w_int > 0 and h_int > 0:
-                    crop_details = {'x1': x1_int, 'y1': y1_int, 'width': w_int, 'height': h_int}
+        crop_details = self.get_crop_details()
 
         self.save_thread = QThread()
         self.save_worker = SaveWorker(self.video_path, save_path, start_time, end_time, crop_details, self.is_muted, self.ffmpeg_codec)
@@ -846,6 +931,36 @@ class VideoEditorWindow(QMainWindow):
         self.save_thread.finished.connect(self.save_thread.deleteLater)
         self.save_worker.finished.connect(self.save_worker.deleteLater)
         self.save_thread.start()
+
+    def save_gif(self):
+        if not self.video_path: return
+        if self.is_playing: self.toggle_play_pause()
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save GIF", f"{os.path.splitext(os.path.basename(self.video_path))[0]}_edited.gif", "GIF Files (*.gif)")
+        if not save_path: return
+
+        self.update_ui_state(True, is_processing=True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Creating GIF... %p%")
+        self.progress_bar.setVisible(True)
+
+        start_time, end_time = self.start_frame / self.fps, self.end_frame / self.fps
+        crop_details = self.get_crop_details()
+
+        gif_fps = 15
+        gif_width = 480
+
+        self.save_gif_thread = QThread()
+        self.save_gif_worker = SaveGifWorker(self.video_path, save_path, start_time, end_time, crop_details, gif_fps, gif_width)
+        self.save_gif_worker.moveToThread(self.save_gif_thread)
+        self.save_gif_worker.progress.connect(self.on_save_progress)
+        self.save_gif_worker.finished.connect(self.on_gif_save_complete)
+        self.save_gif_thread.started.connect(self.save_gif_worker.run)
+        self.save_gif_worker.finished.connect(self.save_gif_thread.quit)
+        self.save_gif_thread.finished.connect(self.save_gif_thread.deleteLater)
+        self.save_gif_worker.finished.connect(self.save_gif_worker.deleteLater)
+        self.save_gif_thread.start()
 
     def save_audio_only(self):
         if not self.video_path or not self.has_audio: return
@@ -884,6 +999,14 @@ class VideoEditorWindow(QMainWindow):
             self.unload_video()
             self.video_path = save_path
             self.load_video()
+
+    def on_gif_save_complete(self, error_message, save_path):
+        self.progress_bar.setVisible(False)
+        self.update_ui_state(is_video_loaded=True)
+        if error_message:
+            self.show_error_message(f"Error creating GIF file:\n{error_message}")
+        else:
+            self.show_success_message(f"GIF successfully saved to:\n{save_path}")
 
     def on_audio_save_complete(self, error_message, save_path):
         self.progress_bar.setVisible(False)
