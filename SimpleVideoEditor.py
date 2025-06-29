@@ -1,6 +1,5 @@
 import sys
 import os
-import cv2
 import time
 import threading
 import numpy as np
@@ -15,12 +14,12 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton,
                              QGridLayout)
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QBrush, QIcon
 from PyQt5.QtCore import Qt, QTimer, QRectF, QObject, QThread, pyqtSignal
-from moviepy.editor import VideoFileClip
+
+from moviepy import VideoFileClip
 import pyaudio
 
 def resource_path(relative_path):
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
@@ -64,7 +63,7 @@ def detect_ffmpeg_hw_acceleration():
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
-            stdout, stderr = proc.communicate()
+            _, stderr = proc.communicate()
             
             if proc.returncode == 0 and b"Unknown encoder" not in stderr:
                 print(f"DEBUG: Found supported HW acceleration: {name}")
@@ -111,7 +110,7 @@ class AudioThread(threading.Thread):
             if seek_frame is not None:
                 try:
                     seek_time = seek_frame / self.video_fps if self.video_fps > 0 else 0
-                    play_clip = self.audio_clip.subclip(seek_time)
+                    play_clip = self.audio_clip.subclipped(seek_time)
                     self.chunk_generator = play_clip.iter_chunks(chunksize=chunk_size)
                 except Exception as e:
                     print(f"DEBUG: Error during audio seek: {e}")
@@ -291,174 +290,79 @@ class LoadVideoWorker(QObject):
 
     def run(self):
         results = {}
+        original_clip = None
         try:
             self.progress.emit(10, "Loading video file...")
-            video_capture = cv2.VideoCapture(self.video_path)
-            original_clip = VideoFileClip(self.video_path, audio_buffersize=500000)
+            original_clip = VideoFileClip(self.video_path)
 
-            if not video_capture.isOpened():
-                raise IOError("Cannot open video file.")
-            
-            results['video_capture'] = video_capture
             results['original_clip'] = original_clip
-            results['fps'] = video_capture.get(cv2.CAP_PROP_FPS) or 30
-            results['total_frames'] = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
-            results['original_width'] = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-            results['original_height'] = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            results['fps'] = original_clip.fps or 30
+            results['total_frames'] = int(original_clip.duration * original_clip.fps)
+            results['original_width'] = original_clip.w
+            results['original_height'] = original_clip.h
 
             self.progress.emit(30, "Analyzing audio...")
             results['has_audio'] = False
             results['waveform_data'] = None
             audio_clip = original_clip.audio
-            if audio_clip and audio_clip.duration and audio_clip.max_volume() > 0.001:
+            if audio_clip and getattr(audio_clip, 'duration', 0) and audio_clip.max_volume() > 0.001:
                 results['has_audio'] = True
                 results['audio_clip'] = audio_clip
                 self.progress.emit(50, "Generating audio waveform...")
-                samples = 1000
-                duration = audio_clip.duration
-                waveform = []
-                if duration and duration > 0:
-                    for i in range(samples):
-                        subclip = audio_clip.subclip(i * duration / samples, (i + 1) * duration / samples)
-                        waveform.append(subclip.max_volume())
-                        if i % 10 == 0:
-                            self.progress.emit(50 + int((i / samples) * 50), f"Generating waveform ({int(i/samples*100)}%)...")
+                
+                try:
+                    sound_array = audio_clip.to_soundarray()
+                    mono_audio = np.abs(sound_array).mean(axis=1) if sound_array.ndim > 1 else np.abs(sound_array)
                     
-                    max_amp = max(waveform) if waveform else 1
-                    if max_amp > 0: waveform = [w / max_amp for w in waveform]
-                    results['waveform_data'] = waveform
-                    print("DEBUG: Waveform generation complete.")
-            
+                    num_display_samples = 1000
+                    chunk_size = len(mono_audio) // num_display_samples
+                    
+                    if chunk_size > 0:
+                        waveform_raw = [np.max(mono_audio[i*chunk_size:(i+1)*chunk_size]) for i in range(num_display_samples)]
+                        max_amp = np.max(waveform_raw)
+                        results['waveform_data'] = [float(w / max_amp) for w in waveform_raw] if max_amp > 0 else [0.0] * num_display_samples
+                    else:
+                        results['waveform_data'] = [0.0] * num_display_samples
+                    print("DEBUG: Waveform generation complete (efficient method).")
+                except Exception as e:
+                    print(f"ERROR: Could not generate waveform: {e}")
+                    results['waveform_data'] = None
+
             self.progress.emit(100, "Load complete!")
             results['error'] = None
 
         except Exception as e:
             print(f"ERROR: Failed to load video: {e}")
             results['error'] = str(e)
-            if 'original_clip' in results and results['original_clip']:
-                results['original_clip'].close()
-            if 'video_capture' in results and results['video_capture']:
-                results['video_capture'].release()
+            if original_clip:
+                original_clip.close()
         
         finally:
             self.finished.emit(results)
 
-
-class SaveWorker(QObject):
+class BaseSaveWorker(QObject):
     finished = pyqtSignal(str, str)
     progress = pyqtSignal(int)
 
-    def __init__(self, video_path, save_path, start_time, end_time, crop_details, is_muted, video_codec):
+    def __init__(self, video_path, save_path, start_time, end_time):
         super().__init__()
         self.video_path = video_path
         self.save_path = save_path
         self.start_time = start_time
         self.end_time = end_time
-        self.crop_details = crop_details
-        self.is_muted = is_muted
-        self.video_codec = video_codec
         self.duration = self.end_time - self.start_time
+        if self.duration <= 0:
+            self.duration = 1
+
+    def get_ffmpeg_command(self, ffmpeg_path):
+        raise NotImplementedError("Subclasses must implement get_ffmpeg_command")
 
     def run(self):
         error_message = ""
         ffmpeg_path = get_ffmpeg_exe()
-        
-        cmd = [
-            ffmpeg_path, '-y', '-ss', str(self.start_time), '-to', str(self.end_time), '-i', self.video_path,
-        ]
-
-        video_filters = []
-        if self.crop_details:
-            w, h, x, y = self.crop_details['width'], self.crop_details['height'], self.crop_details['x1'], self.crop_details['y1']
-            video_filters.append(f"crop={w}:{h}:{x}:{y}")
-
-        if video_filters:
-            cmd.extend(['-vf', ",".join(video_filters)])
-
-        cmd.extend(['-c:v', self.video_codec])
-
-        if self.is_muted:
-            cmd.append('-an')
-        else:
-            cmd.extend(['-c:a', 'aac'])
-
-        cmd.append(self.save_path)
+        cmd = self.get_ffmpeg_command(ffmpeg_path)
         
         print(f"DEBUG: Running FFmpeg command: {' '.join(cmd)}")
-
-        try:
-            startupinfo = None
-            creationflags = 0
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                creationflags = subprocess.CREATE_NO_WINDOW
-
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, startupinfo=startupinfo, creationflags=creationflags)
-            
-            stderr_lines = []
-            time_regex = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
-
-            for line in proc.stderr:
-                stderr_lines.append(line)
-                match = time_regex.search(line)
-                if match:
-                    hours = int(match.group(1))
-                    minutes = int(match.group(2))
-                    seconds = int(match.group(3))
-                    hundredths = int(match.group(4))
-                    current_seconds = hours * 3600 + minutes * 60 + seconds + hundredths / 100
-                    
-                    if self.duration > 0:
-                        percent = min(100, int((current_seconds / self.duration) * 100))
-                        self.progress.emit(percent)
-
-            return_code = proc.wait()
-
-            if return_code != 0:
-                error_message = f"FFmpeg Error (code {return_code}):\n{''.join(stderr_lines)}"
-            else:
-                self.progress.emit(100)
-        except Exception as e:
-            error_message = str(e)
-        finally:
-            self.finished.emit(error_message, self.save_path)
-
-class SaveGifWorker(QObject):
-    finished = pyqtSignal(str, str)
-    progress = pyqtSignal(int)
-
-    def __init__(self, video_path, save_path, start_time, end_time, crop_details, gif_fps, gif_width):
-        super().__init__()
-        self.video_path = video_path
-        self.save_path = save_path
-        self.start_time = start_time
-        self.end_time = end_time
-        self.crop_details = crop_details
-        self.gif_fps = gif_fps
-        self.gif_width = gif_width
-        self.duration = self.end_time - self.start_time
-
-    def run(self):
-        error_message = ""
-        ffmpeg_path = get_ffmpeg_exe()
-
-        video_filters = []
-        if self.crop_details:
-            w, h, x, y = self.crop_details['width'], self.crop_details['height'], self.crop_details['x1'], self.crop_details['y1']
-            video_filters.append(f"crop={w}:{h}:{x}:{y}")
-        
-        video_filters.append(f"fps={self.gif_fps}")
-        video_filters.append(f"scale={self.gif_width}:-1:flags=lanczos")
-        
-        filter_complex = f"{','.join(video_filters)},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-        
-        cmd = [
-            ffmpeg_path, '-y', '-ss', str(self.start_time), '-to', str(self.end_time),
-            '-i', self.video_path, '-filter_complex', filter_complex, self.save_path
-        ]
-        
-        print(f"DEBUG: Running FFmpeg command for GIF: {' '.join(cmd)}")
 
         try:
             startupinfo = None
@@ -479,72 +383,11 @@ class SaveGifWorker(QObject):
                 if match:
                     hours, minutes, seconds, hundredths = map(int, match.groups())
                     current_seconds = hours * 3600 + minutes * 60 + seconds + hundredths / 100
-                    if self.duration > 0:
-                        percent = min(100, int((current_seconds / self.duration) * 100))
-                        self.progress.emit(percent)
-
-            return_code = proc.wait()
-
-            if return_code != 0:
-                error_message = f"FFmpeg Error (code {return_code}):\n{''.join(stderr_lines)}"
-            else:
-                self.progress.emit(100)
-        except Exception as e:
-            error_message = str(e)
-        finally:
-            self.finished.emit(error_message, self.save_path)
-
-
-class SaveAudioWorker(QObject):
-    finished = pyqtSignal(str, str)
-    progress = pyqtSignal(int)
-
-    def __init__(self, video_path, save_path, start_time, end_time):
-        super().__init__()
-        self.video_path = video_path
-        self.save_path = save_path
-        self.start_time = start_time
-        self.end_time = end_time
-        self.duration = self.end_time - self.start_time
-
-    def run(self):
-        error_message = ""
-        ffmpeg_path = get_ffmpeg_exe()
-        
-        cmd = [
-            ffmpeg_path, '-y', '-ss', str(self.start_time), '-to', str(self.end_time),
-            '-i', self.video_path, '-vn', '-c:a', 'libmp3lame', self.save_path,
-        ]
-
-        print(f"DEBUG: Running FFmpeg command: {' '.join(cmd)}")
-        
-        try:
-            startupinfo = None
-            creationflags = 0
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                creationflags = subprocess.CREATE_NO_WINDOW
-
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, startupinfo=startupinfo, creationflags=creationflags)
-            
-            stderr_lines = []
-            time_regex = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
-
-            for line in proc.stderr:
-                stderr_lines.append(line)
-                match = time_regex.search(line)
-                if match:
-                    hours = int(match.group(1))
-                    minutes = int(match.group(2))
-                    seconds = int(match.group(3))
-                    hundredths = int(match.group(4))
-                    current_seconds = hours * 3600 + minutes * 60 + seconds + hundredths / 100
                     
                     if self.duration > 0:
                         percent = min(100, int((current_seconds / self.duration) * 100))
                         self.progress.emit(percent)
-                        
+
             return_code = proc.wait()
 
             if return_code != 0:
@@ -555,6 +398,71 @@ class SaveAudioWorker(QObject):
             error_message = str(e)
         finally:
             self.finished.emit(error_message, self.save_path)
+
+class SaveVideoWorker(BaseSaveWorker):
+    def __init__(self, video_path, save_path, start_time, end_time, crop_details, is_muted, video_codec):
+        super().__init__(video_path, save_path, start_time, end_time)
+        self.crop_details = crop_details
+        self.is_muted = is_muted
+        self.video_codec = video_codec
+
+    def get_ffmpeg_command(self, ffmpeg_path):
+        cmd = [
+            ffmpeg_path, '-y', '-ss', str(self.start_time), '-to', str(self.end_time), '-i', self.video_path,
+        ]
+
+        video_filters = []
+        if self.crop_details:
+            w, h, x, y = self.crop_details['width'], self.crop_details['height'], self.crop_details['x1'], self.crop_details['y1']
+            video_filters.append(f"crop={w}:{h}:{x}:{y}")
+
+        if video_filters:
+            cmd.extend(['-vf', ",".join(video_filters)])
+
+        cmd.extend(['-c:v', self.video_codec])
+
+        if self.is_muted:
+            cmd.append('-an')
+        else:
+            cmd.extend(['-c:a', 'aac'])
+
+        cmd.append(self.save_path)
+        return cmd
+
+class SaveGifWorker(BaseSaveWorker):
+    def __init__(self, video_path, save_path, start_time, end_time, crop_details, gif_fps, gif_width):
+        super().__init__(video_path, save_path, start_time, end_time)
+        self.crop_details = crop_details
+        self.gif_fps = gif_fps
+        self.gif_width = gif_width
+
+    def get_ffmpeg_command(self, ffmpeg_path):
+        video_filters = []
+        if self.crop_details:
+            w, h, x, y = self.crop_details['width'], self.crop_details['height'], self.crop_details['x1'], self.crop_details['y1']
+            video_filters.append(f"crop={w}:{h}:{x}:{y}")
+        
+        video_filters.append(f"fps={self.gif_fps}")
+        video_filters.append(f"scale={self.gif_width}:-1:flags=lanczos")
+        
+        filter_complex = f"{','.join(video_filters)},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+        
+        cmd = [
+            ffmpeg_path, '-y', '-ss', str(self.start_time), '-to', str(self.end_time),
+            '-i', self.video_path, '-filter_complex', filter_complex, self.save_path
+        ]
+        return cmd
+
+class SaveAudioWorker(BaseSaveWorker):
+    def __init__(self, video_path, save_path, start_time, end_time):
+        super().__init__(video_path, save_path, start_time, end_time)
+
+    def get_ffmpeg_command(self, ffmpeg_path):
+        cmd = [
+            ffmpeg_path, '-y', '-ss', str(self.start_time), '-to', str(self.end_time),
+            '-i', self.video_path, '-vn', '-c:a', 'libmp3lame', self.save_path,
+        ]
+        return cmd
 
 class VideoEditorWindow(QMainWindow):
     def __init__(self):
@@ -565,14 +473,15 @@ class VideoEditorWindow(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.setStyleSheet(STYLESHEET)
 
-        self.video_capture, self.original_clip, self.audio_thread, self.video_path = None, None, None, None
+        self.original_clip, self.audio_thread, self.video_path = None, None, None
         self.is_playing, self.is_muted, self.has_audio = False, False, False
         self.start_frame, self.end_frame, self.total_frames = 0, -1, 0
+        self.current_frame_number = 0
         self.fps, self.original_width, self.original_height = 30, 0, 0
         self.ffmpeg_hw_name, self.ffmpeg_codec = "CPU", "libx264"
         
         self.load_thread, self.load_worker = None, None
-        self.save_thread, self.save_worker = None, None
+        self.save_video_thread, self.save_video_worker = None, None
         self.save_gif_thread, self.save_gif_worker = None, None
         self.save_audio_thread, self.save_audio_worker = None, None
 
@@ -703,7 +612,7 @@ class VideoEditorWindow(QMainWindow):
         self.video_path = None
         self.video_display.pixmap_item.setPixmap(QPixmap())
         self.waveform_widget.set_waveform_data(None)
-        self.start_frame, self.end_frame, self.total_frames = 0, -1, 0
+        self.start_frame, self.end_frame, self.total_frames, self.current_frame_number = 0, -1, 0, 0
         self.timeline_slider.setRange(0, 0)
         self.timeline_slider.setValue(0)
         self.update_time_labels()
@@ -745,7 +654,6 @@ class VideoEditorWindow(QMainWindow):
             self.unload_video()
             return
 
-        self.video_capture = results['video_capture']
         self.original_clip = results['original_clip']
         self.fps = results['fps']
         self.total_frames = results['total_frames']
@@ -785,15 +693,13 @@ class VideoEditorWindow(QMainWindow):
             if self.audio_thread: self.audio_thread.pause()
             self.play_pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         else:
-            current_frame = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES))
-            if current_frame >= self.end_frame:
+            if self.current_frame_number >= self.end_frame:
                 self.set_position(self.start_frame)
-                current_frame = self.start_frame
 
             self.is_playing = True
             self.playback_timer.start(int(1000 / self.fps))
             if self.audio_thread:
-                self.audio_thread.seek(current_frame)
+                self.audio_thread.seek(self.current_frame_number)
                 self.audio_thread.resume()
             self.play_pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
 
@@ -806,36 +712,47 @@ class VideoEditorWindow(QMainWindow):
 
     def next_frame(self):
         if not self.is_playing: return
-        current_frame_pos = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES))
-        if current_frame_pos > self.end_frame:
+        
+        if self.current_frame_number > self.end_frame:
             self.toggle_play_pause()
             self.set_position(self.end_frame)
             return
 
-        ret, frame = self.video_capture.read()
-        if ret:
+        try:
+            time_in_seconds = self.current_frame_number / self.fps
+            frame = self.original_clip.get_frame(time_in_seconds)
             self.display_frame(frame)
+            
             self.timeline_slider.blockSignals(True)
-            self.timeline_slider.setValue(current_frame_pos)
+            self.timeline_slider.setValue(self.current_frame_number)
             self.timeline_slider.blockSignals(False)
-            self.update_time_labels_from_slider(current_frame_pos)
-        else:
+            
+            self.update_time_labels_from_slider(self.current_frame_number)
+            self.current_frame_number += 1
+        except Exception as e:
+            print(f"DEBUG: Could not get next frame. Pausing. Error: {e}")
             self.toggle_play_pause()
 
     def set_position(self, frame_number):
-        if self.video_capture:
+        if self.original_clip:
             if self.is_playing: self.toggle_play_pause()
-            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            
+            self.current_frame_number = frame_number
             if self.audio_thread: self.audio_thread.seek(frame_number)
-            ret, frame = self.video_capture.read()
-            if ret: self.display_frame(frame)
+            
+            try:
+                time_in_seconds = frame_number / self.fps
+                frame = self.original_clip.get_frame(time_in_seconds)
+                self.display_frame(frame)
+            except Exception as e:
+                print(f"DEBUG: Could not seek to frame {frame_number}. Error: {e}")
+
             self.update_time_labels()
 
     def display_frame(self, frame):
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
+        h, w, ch = frame.shape
         bytes_per_line = ch * w
-        q_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        q_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
         self.video_display.set_frame(q_image)
 
     def format_time(self, frame_number):
@@ -847,9 +764,8 @@ class VideoEditorWindow(QMainWindow):
         return "00:00.000"
 
     def update_time_labels(self):
-        if self.video_capture:
-            current_frame = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES))
-            self.current_time_label.setText(f"Current: {self.format_time(current_frame)}")
+        if self.original_clip:
+            self.current_time_label.setText(f"Current: {self.format_time(self.current_frame_number)}")
             self.start_time_label.setText(f"Start: {self.format_time(self.start_frame)}")
             self.end_time_label.setText(f"End: {self.format_time(self.end_frame)}")
             self.timeline_slider.set_markers(self.start_frame, self.end_frame, self.total_frames)
@@ -858,13 +774,13 @@ class VideoEditorWindow(QMainWindow):
         self.current_time_label.setText(f"Current: {self.format_time(frame_number)}")
 
     def set_start_point(self):
-        if self.video_capture:
+        if self.original_clip:
             self.start_frame = self.timeline_slider.value()
             if self.start_frame >= self.end_frame: self.end_frame = self.total_frames - 1
             self.update_time_labels()
 
     def set_end_point(self):
-        if self.video_capture:
+        if self.original_clip:
             self.end_frame = self.timeline_slider.value()
             if self.end_frame <= self.start_frame: self.start_frame = 0
             self.update_time_labels()
@@ -921,16 +837,16 @@ class VideoEditorWindow(QMainWindow):
         start_time, end_time = self.start_frame / self.fps, self.end_frame / self.fps
         crop_details = self.get_crop_details()
 
-        self.save_thread = QThread()
-        self.save_worker = SaveWorker(self.video_path, save_path, start_time, end_time, crop_details, self.is_muted, self.ffmpeg_codec)
-        self.save_worker.moveToThread(self.save_thread)
-        self.save_worker.progress.connect(self.on_save_progress)
-        self.save_worker.finished.connect(self.on_video_save_complete)
-        self.save_thread.started.connect(self.save_worker.run)
-        self.save_worker.finished.connect(self.save_thread.quit)
-        self.save_thread.finished.connect(self.save_thread.deleteLater)
-        self.save_worker.finished.connect(self.save_worker.deleteLater)
-        self.save_thread.start()
+        self.save_video_thread = QThread()
+        self.save_video_worker = SaveVideoWorker(self.video_path, save_path, start_time, end_time, crop_details, self.is_muted, self.ffmpeg_codec)
+        self.save_video_worker.moveToThread(self.save_video_thread)
+        self.save_video_worker.progress.connect(self.on_save_progress)
+        self.save_video_worker.finished.connect(self.on_video_save_complete)
+        self.save_video_thread.started.connect(self.save_video_worker.run)
+        self.save_video_worker.finished.connect(self.save_video_thread.quit)
+        self.save_video_thread.finished.connect(self.save_video_thread.deleteLater)
+        self.save_video_worker.finished.connect(self.save_video_worker.deleteLater)
+        self.save_video_thread.start()
 
     def save_gif(self):
         if not self.video_path: return
@@ -947,9 +863,7 @@ class VideoEditorWindow(QMainWindow):
 
         start_time, end_time = self.start_frame / self.fps, self.end_frame / self.fps
         crop_details = self.get_crop_details()
-
-        gif_fps = 15
-        gif_width = 480
+        gif_fps, gif_width = 15, 480
 
         self.save_gif_thread = QThread()
         self.save_gif_worker = SaveGifWorker(self.video_path, save_path, start_time, end_time, crop_details, gif_fps, gif_width)
@@ -1020,15 +934,17 @@ class VideoEditorWindow(QMainWindow):
         print("DEBUG: Cleaning up resources...")
         if self.is_playing: self.toggle_play_pause()
         if self.playback_timer.isActive(): self.playback_timer.stop()
-        if self.video_capture: self.video_capture.release()
+        
         if self.audio_thread:
             self.audio_thread.stop()
             self.audio_thread.join()
-        if self.original_clip: self.original_clip.close()
+        
+        if self.original_clip: 
+            self.original_clip.close()
         
         self.video_display.reset_crop()
         
-        self.video_capture, self.original_clip, self.audio_thread, self.has_audio = None, None, None, False
+        self.original_clip, self.audio_thread, self.has_audio = None, None, False
         print("DEBUG: Resources cleaned.")
 
     def show_error_message(self, message):

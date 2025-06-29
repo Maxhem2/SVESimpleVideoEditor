@@ -1,6 +1,5 @@
-moviepy==1.0.3
+moviepy
 PyQt5
-opencv-python
 PyAudio
 numpy
 imageio-ffmpeg
