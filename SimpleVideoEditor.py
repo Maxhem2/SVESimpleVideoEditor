@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton,
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QBrush, QIcon
 from PyQt5.QtCore import Qt, QTimer, QRectF, QObject, QThread, pyqtSignal
 
-from moviepy import VideoFileClip
+from moviepy import *
 import pyaudio
 
 def resource_path(relative_path):
@@ -523,6 +523,12 @@ class VideoEditorWindow(QMainWindow):
         self.unload_button = QPushButton("Unload Video")
         self.play_pause_button = QPushButton()
         self.play_pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        
+        self.prev_frame_button = QPushButton()
+        self.prev_frame_button.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekBackward))
+        self.next_frame_button = QPushButton()
+        self.next_frame_button.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekForward))
+
         self.mute_button = QPushButton()
         self.mute_button.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
         self.set_start_button = QPushButton("Set Start")
@@ -551,7 +557,9 @@ class VideoEditorWindow(QMainWindow):
         buttons_center_layout = QHBoxLayout()
         buttons_center_layout.setContentsMargins(0,0,0,0)
         buttons_center_layout.addWidget(self.mute_button)
+        buttons_center_layout.addWidget(self.prev_frame_button)
         buttons_center_layout.addWidget(self.play_pause_button)
+        buttons_center_layout.addWidget(self.next_frame_button)
         buttons_center_layout.addWidget(self.set_start_button)
         buttons_center_layout.addWidget(self.set_end_button)
         buttons_center_layout.addWidget(self.crop_button)
@@ -580,6 +588,9 @@ class VideoEditorWindow(QMainWindow):
         self.save_button.clicked.connect(self.save_video)
         self.save_gif_button.clicked.connect(self.save_gif)
         self.save_audio_button.clicked.connect(self.save_audio_only)
+        
+        self.prev_frame_button.clicked.connect(self.step_frame_backward)
+        self.next_frame_button.clicked.connect(self.step_frame_forward)
 
     def detect_and_display_ffmpeg(self):
         self.ffmpeg_hw_name, self.ffmpeg_codec = detect_ffmpeg_hw_acceleration()
@@ -589,6 +600,8 @@ class VideoEditorWindow(QMainWindow):
         self.open_button.setEnabled(not is_processing)
         self.unload_button.setEnabled(is_video_loaded and not is_processing)
         self.play_pause_button.setEnabled(is_video_loaded and not is_processing)
+        self.prev_frame_button.setEnabled(is_video_loaded and not is_processing)
+        self.next_frame_button.setEnabled(is_video_loaded and not is_processing)
         self.timeline_slider.setEnabled(is_video_loaded and not is_processing)
         self.set_start_button.setEnabled(is_video_loaded and not is_processing)
         self.set_end_button.setEnabled(is_video_loaded and not is_processing)
@@ -732,6 +745,20 @@ class VideoEditorWindow(QMainWindow):
         except Exception as e:
             print(f"DEBUG: Could not get next frame. Pausing. Error: {e}")
             self.toggle_play_pause()
+
+    def step_frame_backward(self):
+        if self.original_clip and self.current_frame_number > 0:
+            if self.is_playing: self.toggle_play_pause()
+            new_frame = self.current_frame_number - 1
+            self.set_position(new_frame)
+            self.timeline_slider.setValue(new_frame)
+
+    def step_frame_forward(self):
+        if self.original_clip and self.current_frame_number < self.total_frames - 1:
+            if self.is_playing: self.toggle_play_pause()
+            new_frame = self.current_frame_number + 1
+            self.set_position(new_frame)
+            self.timeline_slider.setValue(new_frame)
 
     def set_position(self, frame_number):
         if self.original_clip:
